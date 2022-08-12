@@ -1,6 +1,6 @@
 use bomber_lib::{
   self,
-  world::{Direction, Enemy, Object, Tile, TileOffset},
+  world::{Direction, Enemy, Object, Ticks, Tile, TileOffset},
   Action, Player,
 };
 use bomber_macro::wasm_export;
@@ -36,19 +36,28 @@ impl Player for MyPlayer {
     self.remember_terrain(surroundings.clone());
     self.remember_objects(surroundings);
 
-    if self.known_hill != None && let Some(next) = self.next_step_to_hill(self.curr_abs_pos) {
+    // if self.known_hill != None && let Some(next) = self.next_step_to_hill(self.curr_abs_pos) {
+    //   // Move towards hill
+    //   println!("0");
+    //   return self.consider_moving(next);
+    // }
+
+    if self.known_hill != None && let Some(next) = self.next_step_to_hill_through_crates(self.curr_abs_pos) {
       // Move towards hill
+      println!("1");
       return self.consider_moving(next);
     }
 
     if let Some(next) = self.next_step_to_frontier(self.curr_abs_pos) {
       // No known path to hill, explore frontier
+      println!("2");
+      println!("{:?}", next);
       return self.consider_moving(next);
     }
 
-    // No reachable frontier. Give up.
-    // XXX Flee when necessary
-    Action::StayStill
+    // No reachable frontier. Idle.
+    println!("3");
+    return self.consider_moving(self.curr_abs_pos);
   }
 
   fn name(&self) -> String {
@@ -70,6 +79,9 @@ impl MyPlayer {
     surroundings: Vec<(Tile, Option<Object>, Option<Enemy>, TileOffset)>,
   ) {
     self.future_explosions.clear();
+    self.visible_powerups.clear();
+    self.visible_crates.clear();
+    self.visible_enemies.clear();
 
     for contents in surroundings {
       let coord = self.get_coord(contents.3);
@@ -78,10 +90,10 @@ impl MyPlayer {
           // do something dumb for now
           for r in 0..=range {
             let r = r as i32;
-            self.future_explosions.insert(Coord(r, 0), 1);
-            self.future_explosions.insert(Coord(-r, 0), 1);
-            self.future_explosions.insert(Coord(0, r), 1);
-            self.future_explosions.insert(Coord(0, -r), 1);
+            self.future_explosions.insert(Coord(coord.0 + r, coord.1), 1);
+            self.future_explosions.insert(Coord(coord.0 - r, coord.1), 1);
+            self.future_explosions.insert(Coord(coord.0, coord.1 + r), 1);
+            self.future_explosions.insert(Coord(coord.0, coord.1 - r), 1);
           }
         },
         Some(Object::PowerUp(_)) => {
@@ -164,7 +176,51 @@ impl MyPlayer {
           }
         }
       }
-      if self.seen_terrain.get(&pos) == Some(&Tile::Floor) {
+      if self.is_walkable(pos) {
+        // Check neighbors
+        for neighbor in neighbors(&pos) {
+          if !visited.contains(&neighbor) {
+            visited.insert(neighbor);
+            backward.insert(neighbor, pos);
+            pending.push_back(neighbor);
+          }
+        }
+      }
+    }
+    None
+  }
+
+  fn next_step_to_hill_through_crates(&self, start: Coord) -> Option<Coord> {
+    if self.known_hill == None {
+      return None;
+    }
+    let mut pending = VecDeque::<Coord>::new();
+    let mut visited = HashSet::<Coord>::new();
+    let mut backward = HashMap::<Coord, Coord>::new();
+    visited.insert(start);
+    pending.push_back(start);
+    backward.insert(start, start);
+    while let Some(pos) = pending.pop_front() {
+      if self.seen_terrain.get(&pos) == Some(&Tile::Hill) {
+        // Found goal
+        let mut pos = pos;
+        loop {
+          match backward.get(&pos) {
+            Some(&prev) => {
+              if prev == start {
+                // Next step after start
+                return Some(pos);
+              } else {
+                pos = prev;
+              }
+            },
+            None => {
+              return None;
+            },
+          }
+        }
+      }
+      if self.seen_terrain.get(&pos) != Some(&Tile::Wall) {
         // Check neighbors
         for neighbor in neighbors(&pos) {
           if !visited.contains(&neighbor) {
@@ -209,7 +265,7 @@ impl MyPlayer {
         }
       }
 
-      if self.seen_terrain.get(&pos) == Some(&Tile::Floor) {
+      if self.seen_terrain.get(&pos) != Some(&Tile::Wall) {
         // Check neighbors
         for neighbor in neighbors(&pos) {
           if !visited.contains(&neighbor) {
@@ -234,7 +290,7 @@ impl MyPlayer {
     pending.push_back(start);
     backward.insert(start, start);
     while let Some(pos) = pending.pop_front() {
-      if self.is_safe(pos) {
+      if self.is_walkable(pos) && self.is_safe(pos) {
         // Found goal
         let mut pos = pos;
         loop {
@@ -254,7 +310,7 @@ impl MyPlayer {
         }
       }
 
-      if self.seen_terrain.get(&pos) == Some(&Tile::Floor) {
+      if self.is_walkable(pos) {
         // Check neighbors
         for neighbor in neighbors(&pos) {
           if !visited.contains(&neighbor) {
@@ -270,35 +326,54 @@ impl MyPlayer {
 
   fn consider_moving(&mut self, next: Coord) -> Action {
     if !self.is_safe(next) {
+      println!("danger");
       // Danger danger
       if self.is_safe(self.curr_abs_pos) {
         // Wait
+        println!("safe where we are");
         return Action::StayStill;
       }
+      // for neighbor in neighbors(&self.curr_abs_pos) {
+      //   if self.is_safe(neighbor) {
+      //     println!("found safe neighbor");
+      //     return Action::Move(self.step_and_record(neighbor));
+      //   }
+      // }
       if let Some(safety) = self.next_step_to_safety(self.curr_abs_pos) {
         // Flee
         return Action::Move(self.step_and_record(safety));
       }
       // Couldn't find safety. Give up.
+      println!("gave up");
       return Action::StayStill;
     }
     if next == self.curr_abs_pos {
+      println!("we think still is safe");
       return Action::StayStill;
     }
 
-    if self.visible_crates.contains(&next) || self.visible_enemies.contains(&next) {
+    if !self.is_walkable(next) {
       // Blocked, let's see if we can explode it
       for r in 0..=5 {
-        self.future_explosions.insert(Coord(r, 0), 2);
-        self.future_explosions.insert(Coord(-r, 0), 2);
-        self.future_explosions.insert(Coord(0, r), 2);
-        self.future_explosions.insert(Coord(0, -r), 2);
+        self.future_explosions.insert(Coord(next.0 + r, next.1), 2);
+        self.future_explosions.insert(Coord(next.0 - r, next.1), 2);
+        self.future_explosions.insert(Coord(next.0, next.1 + r), 2);
+        self.future_explosions.insert(Coord(next.0, next.1 - r), 2);
       }
+      // for neighbor in neighbors(&self.curr_abs_pos) {
+      //   if self.is_safe(neighbor) {
+      //     println!("found safe neighbor");
+      //     return Action::DropBombAndMove(self.step_and_record(neighbor));
+      //   }
+      // }
+      // return Action::DropBomb;
       if let Some(safety) = self.next_step_to_safety(self.curr_abs_pos) {
         return Action::DropBombAndMove(self.step_and_record(safety));
       }
       // Bomb would be suicidal, wait a tick
-      return Action::StayStill;
+      // return Action::StayStill;
+      // YOLO DO IT ANYWAY
+      return Action::DropBomb;
     }
 
     return Action::Move(self.step_and_record(next));
@@ -318,11 +393,24 @@ impl MyPlayer {
     dir
   }
 
+  fn is_walkable(&self, next: Coord) -> bool {
+    self.seen_terrain.get(&next) != Some(&Tile::Wall)
+      && !self.visible_crates.contains(&next)
+      && !self.visible_enemies.contains(&next)
+  }
+
   fn is_safe(&self, next: Coord) -> bool {
     // dumb for now
     if self.future_explosions.contains_key(&next) {
+      println!(
+        "{:?} not safe, terrain: {:?}, {:?}",
+        next,
+        self.seen_terrain.get(&next),
+        self.future_explosions.contains_key(&next)
+      );
       false
     } else {
+      println!("{:?} safe", next);
       true
     }
   }
@@ -341,81 +429,110 @@ fn neighbors(pos: &Coord) -> [Coord; 4] {
 mod tests {
   use super::*;
 
-  #[test]
-  fn empty_world() {
-    let mut player = MyPlayer::default();
-    assert_eq!(player.act(vec![]), Action::StayStill);
-  }
+  // #[test]
+  // fn empty_world() {
+  //   let mut player = MyPlayer::default();
+  //   assert_eq!(player.act(vec![]), Action::StayStill);
+  // }
+
+  // #[test]
+  // fn closed_floor() {
+  //   let mut player = MyPlayer::default();
+  //   let world = vec![
+  //     (Tile::Floor, None, None, TileOffset(0, 0)),
+  //     (Tile::Wall, None, None, TileOffset(1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(1, 0)),
+  //     (Tile::Wall, None, None, TileOffset(1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(0, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 0)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(0, 1)),
+  //   ];
+  //   assert_eq!(player.act(world), Action::StayStill);
+  // }
+
+  // #[test]
+  // fn closed_hill() {
+  //   let mut player = MyPlayer::default();
+  //   let world = vec![
+  //     (Tile::Hill, None, None, TileOffset(0, 0)),
+  //     (Tile::Wall, None, None, TileOffset(1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(1, 0)),
+  //     (Tile::Wall, None, None, TileOffset(1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(0, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 0)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(0, 1)),
+  //   ];
+  //   assert_eq!(player.act(world), Action::StayStill);
+  // }
+
+  // #[test]
+  // fn adj_to_hill() {
+  //   let mut player = MyPlayer::default();
+  //   let world = vec![
+  //     (Tile::Floor, None, None, TileOffset(0, 0)),
+  //     (Tile::Hill, None, None, TileOffset(1, 0)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(0, 1)),
+  //     (Tile::Wall, None, None, TileOffset(1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(2, 1)),
+  //     (Tile::Wall, None, None, TileOffset(2, 0)),
+  //     (Tile::Wall, None, None, TileOffset(2, -1)),
+  //     (Tile::Wall, None, None, TileOffset(2, -1)),
+  //     (Tile::Wall, None, None, TileOffset(1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(0, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 0)),
+  //   ];
+  //   assert_eq!(player.act(world), Action::Move(Direction::East));
+  // }
+
+  // #[test]
+  // fn adj_to_frontier() {
+  //   let mut player = MyPlayer::default();
+  //   let world = vec![
+  //     (Tile::Floor, None, None, TileOffset(0, 0)),
+  //     (Tile::Floor, None, None, TileOffset(1, 0)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(0, 1)),
+  //     (Tile::Wall, None, None, TileOffset(1, 1)),
+  //     (Tile::Wall, None, None, TileOffset(1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(0, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, -1)),
+  //     (Tile::Wall, None, None, TileOffset(-1, 0)),
+  //   ];
+  //   assert_eq!(player.act(world), Action::Move(Direction::East));
+  // }
 
   #[test]
-  fn closed_floor() {
+  fn avoid_bomb() {
     let mut player = MyPlayer::default();
     let world = vec![
       (Tile::Floor, None, None, TileOffset(0, 0)),
-      (Tile::Wall, None, None, TileOffset(1, 1)),
-      (Tile::Wall, None, None, TileOffset(1, 0)),
-      (Tile::Wall, None, None, TileOffset(1, -1)),
-      (Tile::Wall, None, None, TileOffset(0, -1)),
-      (Tile::Wall, None, None, TileOffset(-1, -1)),
+      (
+        Tile::Floor,
+        Some(Object::Bomb { fuse_remaining: Ticks(1), range: 2 }),
+        None,
+        TileOffset(1, 0),
+      ),
+      (Tile::Floor, None, None, TileOffset(0, 1)),
+      (Tile::Floor, None, None, TileOffset(1, 1)),
       (Tile::Wall, None, None, TileOffset(-1, 0)),
       (Tile::Wall, None, None, TileOffset(-1, 1)),
-      (Tile::Wall, None, None, TileOffset(0, 1)),
-    ];
-    assert_eq!(player.act(world), Action::StayStill);
-  }
-
-  #[test]
-  fn closed_hill() {
-    let mut player = MyPlayer::default();
-    let world = vec![
-      (Tile::Hill, None, None, TileOffset(0, 0)),
-      (Tile::Wall, None, None, TileOffset(1, 1)),
-      (Tile::Wall, None, None, TileOffset(1, 0)),
-      (Tile::Wall, None, None, TileOffset(1, -1)),
-      (Tile::Wall, None, None, TileOffset(0, -1)),
-      (Tile::Wall, None, None, TileOffset(-1, -1)),
-      (Tile::Wall, None, None, TileOffset(-1, 0)),
-      (Tile::Wall, None, None, TileOffset(-1, 1)),
-      (Tile::Wall, None, None, TileOffset(0, 1)),
-    ];
-    assert_eq!(player.act(world), Action::StayStill);
-  }
-
-  #[test]
-  fn adj_to_hill() {
-    let mut player = MyPlayer::default();
-    let world = vec![
-      (Tile::Floor, None, None, TileOffset(0, 0)),
-      (Tile::Hill, None, None, TileOffset(1, 0)),
-      (Tile::Wall, None, None, TileOffset(-1, 1)),
-      (Tile::Wall, None, None, TileOffset(0, 1)),
-      (Tile::Wall, None, None, TileOffset(1, 1)),
+      (Tile::Wall, None, None, TileOffset(-1, 2)),
+      (Tile::Wall, None, None, TileOffset(0, 2)),
+      (Tile::Wall, None, None, TileOffset(1, 2)),
+      (Tile::Wall, None, None, TileOffset(2, 2)),
       (Tile::Wall, None, None, TileOffset(2, 1)),
       (Tile::Wall, None, None, TileOffset(2, 0)),
       (Tile::Wall, None, None, TileOffset(2, -1)),
-      (Tile::Wall, None, None, TileOffset(2, -1)),
       (Tile::Wall, None, None, TileOffset(1, -1)),
       (Tile::Wall, None, None, TileOffset(0, -1)),
       (Tile::Wall, None, None, TileOffset(-1, -1)),
-      (Tile::Wall, None, None, TileOffset(-1, 0)),
     ];
-    assert_eq!(player.act(world), Action::Move(Direction::East));
-  }
-
-  #[test]
-  fn adj_to_frontier() {
-    let mut player = MyPlayer::default();
-    let world = vec![
-      (Tile::Floor, None, None, TileOffset(0, 0)),
-      (Tile::Floor, None, None, TileOffset(1, 0)),
-      (Tile::Wall, None, None, TileOffset(-1, 1)),
-      (Tile::Wall, None, None, TileOffset(0, 1)),
-      (Tile::Wall, None, None, TileOffset(1, 1)),
-      (Tile::Wall, None, None, TileOffset(1, -1)),
-      (Tile::Wall, None, None, TileOffset(0, -1)),
-      (Tile::Wall, None, None, TileOffset(-1, -1)),
-      (Tile::Wall, None, None, TileOffset(-1, 0)),
-    ];
-    assert_eq!(player.act(world), Action::Move(Direction::East));
+    assert_eq!(player.act(world), Action::Move(Direction::North));
   }
 }
