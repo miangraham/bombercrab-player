@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly"
+components = [ "rust-src", "rustfmt", "rust-analyzer-preview" ]
+targets = [ "x86_64-unknown-linux-gnu", "wasm32-unknown-unknown" ]
+profile = "default"
