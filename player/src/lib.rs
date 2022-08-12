@@ -20,6 +20,11 @@ struct MyPlayer {
   seen_terrain: HashMap<Coord, Tile>,
   known_hill: Option<Coord>,
   frontier: HashSet<Coord>,
+
+  visible_crates: HashSet<Coord>,
+  visible_enemies: HashSet<Coord>,
+  visible_powerups: HashSet<Coord>,
+  future_explosions: HashMap<Coord, u32>,
 }
 
 #[wasm_export]
@@ -28,23 +33,21 @@ impl Player for MyPlayer {
     &mut self,
     surroundings: Vec<(Tile, Option<Object>, Option<Enemy>, TileOffset)>,
   ) -> Action {
-    self.remember_terrain(surroundings);
+    self.remember_terrain(surroundings.clone());
+    self.remember_objects(surroundings);
 
     if self.known_hill != None && let Some(next) = self.next_step_to_hill(self.curr_abs_pos) {
-      if next == self.curr_abs_pos {
-        // King of the hill
-        return Action::StayStill;
-      }
-      // Take known path to hill
-      return Action::Move(self.step_and_record(next));
+      // Move towards hill
+      return self.consider_moving(next);
     }
 
     if let Some(next) = self.next_step_to_frontier(self.curr_abs_pos) {
       // No known path to hill, explore frontier
-      return Action::Move(self.step_and_record(next));
+      return self.consider_moving(next);
     }
 
     // No reachable frontier. Give up.
+    // XXX Flee when necessary
     Action::StayStill
   }
 
@@ -60,6 +63,47 @@ impl Player for MyPlayer {
 impl MyPlayer {
   fn get_coord(&self, offset: TileOffset) -> Coord {
     Coord(offset.0 + self.curr_abs_pos.0, offset.1 + self.curr_abs_pos.1)
+  }
+
+  fn remember_objects(
+    &mut self,
+    surroundings: Vec<(Tile, Option<Object>, Option<Enemy>, TileOffset)>,
+  ) {
+    self.future_explosions.clear();
+
+    for contents in surroundings {
+      let coord = self.get_coord(contents.3);
+      match contents.1 {
+        Some(Object::Bomb { fuse_remaining: _, range }) => {
+          // do something dumb for now
+          for r in 0..=range {
+            let r = r as i32;
+            self.future_explosions.insert(Coord(r, 0), 1);
+            self.future_explosions.insert(Coord(-r, 0), 1);
+            self.future_explosions.insert(Coord(0, r), 1);
+            self.future_explosions.insert(Coord(0, -r), 1);
+          }
+        },
+        Some(Object::PowerUp(_)) => {
+          self.visible_powerups.insert(coord);
+        },
+        Some(Object::Crate) => {
+          self.visible_crates.insert(coord);
+        },
+        None => {
+          self.visible_powerups.remove(&coord);
+          self.visible_crates.remove(&coord);
+        },
+      }
+      match contents.2 {
+        Some(_) => {
+          self.visible_enemies.insert(coord);
+        },
+        None => {
+          self.visible_enemies.remove(&coord);
+        },
+      }
+    }
   }
 
   fn remember_terrain(
@@ -120,12 +164,14 @@ impl MyPlayer {
           }
         }
       }
-      // Check neighbors
-      for neighbor in neighbors(&pos) {
-        if !visited.contains(&neighbor) {
-          visited.insert(neighbor);
-          backward.insert(neighbor, pos);
-          pending.push_back(neighbor);
+      if self.seen_terrain.get(&pos) == Some(&Tile::Floor) {
+        // Check neighbors
+        for neighbor in neighbors(&pos) {
+          if !visited.contains(&neighbor) {
+            visited.insert(neighbor);
+            backward.insert(neighbor, pos);
+            pending.push_back(neighbor);
+          }
         }
       }
     }
@@ -163,16 +209,99 @@ impl MyPlayer {
         }
       }
 
-      // Check neighbors
-      for neighbor in neighbors(&pos) {
-        if !visited.contains(&neighbor) {
-          visited.insert(neighbor);
-          backward.insert(neighbor, pos);
-          pending.push_back(neighbor);
+      if self.seen_terrain.get(&pos) == Some(&Tile::Floor) {
+        // Check neighbors
+        for neighbor in neighbors(&pos) {
+          if !visited.contains(&neighbor) {
+            visited.insert(neighbor);
+            backward.insert(neighbor, pos);
+            pending.push_back(neighbor);
+          }
         }
       }
     }
     None
+  }
+
+  fn next_step_to_safety(&self, start: Coord) -> Option<Coord> {
+    if self.future_explosions.is_empty() {
+      return Some(start);
+    }
+    let mut pending = VecDeque::<Coord>::new();
+    let mut visited = HashSet::<Coord>::new();
+    let mut backward = HashMap::<Coord, Coord>::new();
+    visited.insert(start);
+    pending.push_back(start);
+    backward.insert(start, start);
+    while let Some(pos) = pending.pop_front() {
+      if self.is_safe(pos) {
+        // Found goal
+        let mut pos = pos;
+        loop {
+          match backward.get(&pos) {
+            Some(&prev) => {
+              if prev == start {
+                // Next step after start
+                return Some(pos);
+              } else {
+                pos = prev;
+              }
+            },
+            None => {
+              return None;
+            },
+          }
+        }
+      }
+
+      if self.seen_terrain.get(&pos) == Some(&Tile::Floor) {
+        // Check neighbors
+        for neighbor in neighbors(&pos) {
+          if !visited.contains(&neighbor) {
+            visited.insert(neighbor);
+            backward.insert(neighbor, pos);
+            pending.push_back(neighbor);
+          }
+        }
+      }
+    }
+    None
+  }
+
+  fn consider_moving(&mut self, next: Coord) -> Action {
+    if !self.is_safe(next) {
+      // Danger danger
+      if self.is_safe(self.curr_abs_pos) {
+        // Wait
+        return Action::StayStill;
+      }
+      if let Some(safety) = self.next_step_to_safety(self.curr_abs_pos) {
+        // Flee
+        return Action::Move(self.step_and_record(safety));
+      }
+      // Couldn't find safety. Give up.
+      return Action::StayStill;
+    }
+    if next == self.curr_abs_pos {
+      return Action::StayStill;
+    }
+
+    if self.visible_crates.contains(&next) || self.visible_enemies.contains(&next) {
+      // Blocked, let's see if we can explode it
+      for r in 0..=5 {
+        self.future_explosions.insert(Coord(r, 0), 2);
+        self.future_explosions.insert(Coord(-r, 0), 2);
+        self.future_explosions.insert(Coord(0, r), 2);
+        self.future_explosions.insert(Coord(0, -r), 2);
+      }
+      if let Some(safety) = self.next_step_to_safety(self.curr_abs_pos) {
+        return Action::DropBombAndMove(self.step_and_record(safety));
+      }
+      // Bomb would be suicidal, wait a tick
+      return Action::StayStill;
+    }
+
+    return Action::Move(self.step_and_record(next));
   }
 
   fn step_and_record(&mut self, next: Coord) -> Direction {
@@ -187,6 +316,15 @@ impl MyPlayer {
     };
     self.curr_abs_pos = next;
     dir
+  }
+
+  fn is_safe(&self, next: Coord) -> bool {
+    // dumb for now
+    if self.future_explosions.contains_key(&next) {
+      false
+    } else {
+      true
+    }
   }
 }
 
