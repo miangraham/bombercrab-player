@@ -25,6 +25,8 @@ struct MyPlayer {
   visible_enemies: HashSet<Coord>,
   visible_powerups: HashSet<Coord>,
   future_explosions: HashMap<Coord, u32>,
+
+  tick_num: u32,
 }
 
 #[wasm_export]
@@ -33,14 +35,15 @@ impl Player for MyPlayer {
     &mut self,
     surroundings: Vec<(Tile, Option<Object>, Option<Enemy>, TileOffset)>,
   ) -> Action {
+    self.tick_num += 1;
     self.remember_terrain(surroundings.clone());
     self.remember_objects(surroundings);
 
-    // if self.known_hill != None && let Some(next) = self.next_step_to_hill(self.curr_abs_pos) {
-    //   // Move towards hill
-    //   println!("0");
-    //   return self.consider_moving(next);
-    // }
+    if self.known_hill != None && let Some(next) = self.next_step_to_hill(self.curr_abs_pos) {
+      // Move towards hill
+      println!("0");
+      return self.consider_moving(next);
+    }
 
     if self.known_hill != None && let Some(next) = self.next_step_to_hill_through_crates(self.curr_abs_pos) {
       // Move towards hill
@@ -345,7 +348,7 @@ impl MyPlayer {
       }
       // Couldn't find safety. Give up.
       println!("gave up");
-      return Action::StayStill;
+      return Action::DropBomb;
     }
     if next == self.curr_abs_pos {
       println!("we think still is safe");
@@ -376,6 +379,9 @@ impl MyPlayer {
       return Action::DropBomb;
     }
 
+    if self.tick_num % 10 == 0 {
+      return Action::DropBombAndMove(self.step_and_record(next));
+    }
     return Action::Move(self.step_and_record(next));
   }
 
@@ -419,8 +425,8 @@ impl MyPlayer {
 fn neighbors(pos: &Coord) -> [Coord; 4] {
   [
     Coord(pos.0 + 1, pos.1),
-    Coord(pos.0 - 1, pos.1),
     Coord(pos.0, pos.1 - 1),
+    Coord(pos.0 - 1, pos.1),
     Coord(pos.0, pos.1 + 1),
   ]
 }
